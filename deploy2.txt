@@ -1,0 +1,13 @@
+
+ Ôøà´©Å wrangler 4.68.1 (update available 4.69.0)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+Total Upload: 58.01 KiB / gzip: 13.14 KiB
+Worker Startup Time: 12 ms
+Your Worker has access to the following bindings:
+Binding                                 Resource            
+env.TUNNEL_MANAGER (TunnelManager)      Durable Object      
+
+Uploaded bufferwave-worker (11.74 sec)
+Deployed bufferwave-worker triggers (5.33 sec)
+  https://bufferwave-worker.bufferwave.workers.dev
+Current Version ID: a1625b22-2e1a-4adb-9449-14daf1238028

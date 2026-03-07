@@ -1,0 +1,7 @@
+﻿name = "friendlynet-mesh"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+VLESS_UUID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+PROXY_IP = "cdn.xn--b6gac.eu.org"

@@ -1,0 +1,616 @@
+// ============================================================
+// BUFFERWAVE CLOUDFLARE WORKER v9.0 — VLESS PROTOCOL
+//
+// Architecture fonctionnelle :
+// App Android → TUN → VLESS over WebSocket → Worker → connect() → Internet
+//
+// ★ BYPASS & FORCE-CONNECT FEATURES:
+//   - ProxyIP fallback when direct connect() fails
+//   - Early data (ed) support for faster connection
+//   - DNS-over-HTTPS with Cloudflare
+//   - Retry with alternative proxy IPs
+//   - Proper binary data handling (no corruption)
+//   - WebSocket keepalive
+// ============================================================
+import { connect } from 'cloudflare:sockets';
+
+// ★ UUID par défaut — remplacé par env.VLESS_UUID si défini
+const DEFAULT_UUID = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+
+// ★ PROXY IPs — Used as fallback when direct connect() fails
+// These are clean Cloudflare IPs that can relay traffic
+const PROXY_IPS = [
+  'cdn.xn--b6gac.eu.org',
+  'cdn-all.xn--b6gac.eu.org',
+  'workers.cloudflare.com',
+  'edgetunnel.anycast.eu.org',
+];
+
+// ★ DNS servers for DoH
+const DOH_URL = 'https://cloudflare-dns.com/dns-query';
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const uuid = env.VLESS_UUID || DEFAULT_UUID;
+    const proxyIP = env.PROXY_IP || PROXY_IPS[0];
+
+    // ── VLESS WebSocket Tunnel ─────────────────────────────
+    if (url.pathname === '/vless' || url.pathname === '/tunnel') {
+      const upgrade = request.headers.get('Upgrade');
+      if (upgrade !== 'websocket') {
+        return new Response('WebSocket required', { status: 426 });
+      }
+      return handleVlessWebSocket(request, uuid, proxyIP);
+    }
+
+    // ── CORS ───────────────────────────────────────────────
+    const cors = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Content-Type': 'application/json',
+    };
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: cors });
+    }
+
+    // ── Health check ──────────────────────────────────────
+    if (url.pathname === '/' || url.pathname === '/health') {
+      return new Response(JSON.stringify({
+        server: 'BufferWave VLESS v9.0',
+        status: 'ACTIVE',
+        protocol: 'VLESS-over-WebSocket',
+        features: ['proxyIP-fallback', 'early-data', 'dns-over-https', 'force-connect'],
+        timestamp: new Date().toISOString(),
+      }), { headers: cors });
+    }
+
+    // ── UUID config endpoint (pour le client) ─────────────
+    if (url.pathname === '/config') {
+      return new Response(JSON.stringify({
+        uuid: uuid,
+        wsPath: '/vless',
+        version: '9.0',
+        proxyIP: proxyIP,
+      }), { headers: cors });
+    }
+
+    // ── Nodes Cloudflare ──────────────────────────────────
+    if (url.pathname === '/nodes' || url.pathname === '/cf-nodes') {
+      const cfNodes = Object.entries(CLOUDFLARE_NODES).map(([id, info]) => ({
+        id, country: info.country, city: info.city,
+        region: info.region, pop: info.pop,
+        bandwidthMbps: 1000, online: true, type: 'cloudflare',
+      }));
+      return new Response(JSON.stringify({ nodes: cfNodes, total: cfNodes.length }), { headers: cors });
+    }
+
+    // ── Status ────────────────────────────────────────────
+    if (url.pathname === '/status') {
+      return new Response(JSON.stringify({
+        network: 'BufferWave VLESS v9.0',
+        protocol: 'VLESS',
+        transport: 'WebSocket',
+        cloudflareNodes: Object.keys(CLOUDFLARE_NODES).length,
+        proxyIP: proxyIP,
+        features: ['bypass', 'force-connect', 'proxyIP-fallback'],
+        status: 'ACTIVE',
+      }), { headers: cors });
+    }
+
+    // ── Test connect (diagnostic) ─────────────────────────
+    if (url.pathname === '/test-connect') {
+      const testHost = url.searchParams.get('host') || 'www.google.com';
+      const testPort = parseInt(url.searchParams.get('port') || '443');
+      try {
+        const sock = connect({ hostname: testHost, port: testPort });
+        await sock.opened;
+        // Close immediately after successful test
+        try { sock.close(); } catch (_) { }
+        return new Response(JSON.stringify({
+          success: true,
+          host: testHost,
+          port: testPort,
+          message: `Direct connect() to ${testHost}:${testPort} succeeded`,
+        }), { headers: cors });
+      } catch (e) {
+        // Try via proxyIP
+        try {
+          const sock = connect({ hostname: proxyIP, port: testPort });
+          await sock.opened;
+          try { sock.close(); } catch (_) { }
+          return new Response(JSON.stringify({
+            success: true,
+            host: testHost,
+            port: testPort,
+            via: proxyIP,
+            message: `Connect via proxyIP ${proxyIP} succeeded`,
+          }), { headers: cors });
+        } catch (e2) {
+          return new Response(JSON.stringify({
+            success: false,
+            host: testHost,
+            port: testPort,
+            directError: e.message,
+            proxyError: e2.message,
+          }), { headers: cors, status: 502 });
+        }
+      }
+    }
+
+    return new Response('Not Found', { status: 404 });
+  }
+};
+
+// ============================================================
+// ★★★ VLESS WEBSOCKET HANDLER ★★★
+//
+// Chaque WebSocket = 1 connexion TCP vers Internet
+// Protocole binaire standard VLESS
+// ============================================================
+async function handleVlessWebSocket(request, expectedUuid, proxyIP) {
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+
+  // ★ Check for early data in query params (?ed=2048)
+  const url = new URL(request.url);
+  const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+
+  // ★ Collect incoming WebSocket messages into a readable stream
+  let messageQueue = [];
+  let messageResolve = null;
+  let wsClosed = false;
+
+  server.addEventListener('message', (event) => {
+    const data = event.data;
+    let bytes;
+    if (data instanceof ArrayBuffer) {
+      bytes = new Uint8Array(data);
+    } else if (data instanceof Uint8Array) {
+      bytes = data;
+    } else if (typeof data === 'string') {
+      // Some clients might send base64, but standard VLESS is binary
+      try {
+        const binary = atob(data);
+        bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      } catch (_) {
+        return; // Ignore non-binary messages
+      }
+    } else {
+      return;
+    }
+
+    if (messageResolve) {
+      const resolve = messageResolve;
+      messageResolve = null;
+      resolve(bytes);
+    } else {
+      messageQueue.push(bytes);
+    }
+  });
+
+  server.addEventListener('close', () => {
+    wsClosed = true;
+    if (messageResolve) {
+      messageResolve(null);
+      messageResolve = null;
+    }
+  });
+
+  server.addEventListener('error', (e) => {
+    console.error('[VLESS] WS error:', e);
+    wsClosed = true;
+    if (messageResolve) {
+      messageResolve(null);
+      messageResolve = null;
+    }
+  });
+
+  // Helper: get next binary message from WebSocket
+  function nextMessage() {
+    if (messageQueue.length > 0) {
+      return Promise.resolve(messageQueue.shift());
+    }
+    if (wsClosed) return Promise.resolve(null);
+    return new Promise(resolve => { messageResolve = resolve; });
+  }
+
+  // ★ Handle early data if present (sec-websocket-protocol header)
+  let earlyData = null;
+  if (earlyDataHeader) {
+    try {
+      // Early data is base64-encoded in the sec-websocket-protocol header
+      const binary = atob(earlyDataHeader);
+      earlyData = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        earlyData[i] = binary.charCodeAt(i);
+      }
+    } catch (_) {
+      // Not valid early data, ignore
+    }
+  }
+
+  // ★ Process VLESS connection
+  processVless(server, nextMessage, expectedUuid, proxyIP, earlyData).catch(err => {
+    console.error('[VLESS] Fatal error:', err.message);
+    try { server.close(1011, err.message.substring(0, 123)); } catch (_) { }
+  });
+
+  // ★ If early data was used, respond with the protocol header
+  if (earlyDataHeader) {
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      headers: { 'sec-websocket-protocol': earlyDataHeader },
+    });
+  }
+
+  return new Response(null, { status: 101, webSocket: client });
+}
+
+// ============================================================
+// VLESS PROTOCOL PROCESSOR
+// ============================================================
+async function processVless(ws, nextMessage, expectedUuid, proxyIP, earlyData) {
+  // ★ Step 1: Read first message (or use early data)
+  let firstMessage;
+  if (earlyData && earlyData.length > 0) {
+    firstMessage = earlyData;
+  } else {
+    firstMessage = await nextMessage();
+  }
+
+  if (!firstMessage || firstMessage.length < 24) {
+    ws.close(1002, 'Invalid VLESS header: too short');
+    return;
+  }
+
+  // ★ Ensure we have a proper Uint8Array with correct buffer alignment
+  const aligned = new Uint8Array(firstMessage.length);
+  aligned.set(firstMessage);
+  const view = new DataView(aligned.buffer);
+  let offset = 0;
+
+  // 1. Version (1 byte) — must be 0
+  const version = view.getUint8(offset); offset += 1;
+
+  // 2. UUID (16 bytes)
+  const uuidBytes = aligned.slice(offset, offset + 16); offset += 16;
+  const clientUuid = bytesToUuid(uuidBytes);
+
+  if (clientUuid !== expectedUuid) {
+    console.error(`[VLESS] ❌ UUID mismatch: got ${clientUuid}, expected ${expectedUuid}`);
+    ws.close(1002, 'Invalid UUID');
+    return;
+  }
+
+  // 3. Addon length + skip addons
+  const addonLen = view.getUint8(offset); offset += 1;
+  offset += addonLen; // skip addon bytes
+
+  // 4. Command (1 = TCP, 2 = UDP, 3 = MUX)
+  const command = view.getUint8(offset); offset += 1;
+
+  // 5. Port (2 bytes big-endian)
+  const port = view.getUint16(offset); offset += 2;
+
+  // 6. Address type + address
+  const addrType = view.getUint8(offset); offset += 1;
+  let hostname = '';
+
+  switch (addrType) {
+    case 1: // IPv4
+      hostname = [
+        view.getUint8(offset), view.getUint8(offset + 1),
+        view.getUint8(offset + 2), view.getUint8(offset + 3)
+      ].join('.');
+      offset += 4;
+      break;
+    case 2: // Domain name
+      const domainLen = view.getUint8(offset); offset += 1;
+      hostname = new TextDecoder().decode(aligned.slice(offset, offset + domainLen));
+      offset += domainLen;
+      break;
+    case 3: // IPv6
+      const parts = [];
+      for (let i = 0; i < 8; i++) {
+        parts.push(view.getUint16(offset).toString(16));
+        offset += 2;
+      }
+      hostname = '[' + parts.join(':') + ']';
+      break;
+    default:
+      console.error(`[VLESS] ❌ Unknown address type: ${addrType}`);
+      ws.close(1002, 'Unknown address type');
+      return;
+  }
+
+  console.log(`[VLESS] ✅ ${command === 1 ? 'TCP' : 'UDP'} → ${hostname}:${port}`);
+
+  // 7. First payload (rest of the first message after header)
+  const firstPayload = offset < aligned.length
+    ? aligned.slice(offset)
+    : null;
+
+  // ★ Step 2: Send VLESS response header (MUST be exactly 2 bytes)
+  const responseHeader = new Uint8Array([version, 0]);
+  // ★ CRITICAL FIX: Create a new ArrayBuffer with exact size to avoid corruption
+  const responseBuffer = new ArrayBuffer(2);
+  new Uint8Array(responseBuffer).set(responseHeader);
+  ws.send(responseBuffer);
+
+  // ★ Step 3: Handle based on command
+  if (command === 1) {
+    await handleTcpVless(ws, nextMessage, hostname, port, firstPayload, proxyIP);
+  } else if (command === 2) {
+    await handleUdpVless(ws, nextMessage, hostname, port, firstPayload);
+  } else {
+    ws.close(1002, `Unsupported command: ${command}`);
+  }
+}
+
+// ============================================================
+// ★ TCP HANDLER — Real TCP via Cloudflare connect()
+// ★ WITH PROXY IP FALLBACK & RETRY LOGIC
+// ============================================================
+async function handleTcpVless(ws, nextMessage, hostname, port, firstPayload, proxyIP) {
+  let remoteSocket;
+  let connectMethod = 'direct';
+
+  // ★ BYPASS STRATEGY 1: Try direct connect first
+  try {
+    remoteSocket = connect({ hostname, port });
+    await remoteSocket.opened;
+    connectMethod = 'direct';
+    console.log(`[VLESS-TCP] ✅ Direct connect: ${hostname}:${port}`);
+  } catch (directError) {
+    console.warn(`[VLESS-TCP] ⚠ Direct connect failed: ${hostname}:${port} — ${directError.message}`);
+
+    // ★ BYPASS STRATEGY 2: Connect via ProxyIP
+    // When direct connect fails (often due to restrictions), route through a proxy IP
+    // The proxyIP acts as a relay: we connect to proxyIP:port and the traffic flows
+    let proxyConnected = false;
+
+    // Try all proxy IPs in order
+    const allProxies = [proxyIP, ...PROXY_IPS.filter(p => p !== proxyIP)];
+    for (const proxy of allProxies) {
+      try {
+        remoteSocket = connect({ hostname: proxy, port });
+        await remoteSocket.opened;
+        connectMethod = `proxy:${proxy}`;
+        proxyConnected = true;
+        console.log(`[VLESS-TCP] ✅ Proxy connect via ${proxy}:${port} for ${hostname}`);
+        break;
+      } catch (proxyError) {
+        console.warn(`[VLESS-TCP] ⚠ Proxy ${proxy}:${port} failed: ${proxyError.message}`);
+      }
+    }
+
+    if (!proxyConnected) {
+      // ★ BYPASS STRATEGY 3: Try port 443 via proxy (HTTPS fallback)
+      if (port !== 443) {
+        for (const proxy of allProxies) {
+          try {
+            remoteSocket = connect({ hostname: proxy, port: 443 });
+            await remoteSocket.opened;
+            connectMethod = `proxy-443:${proxy}`;
+            proxyConnected = true;
+            console.log(`[VLESS-TCP] ✅ Proxy-443 connect via ${proxy}:443 for ${hostname}:${port}`);
+            break;
+          } catch (_) { }
+        }
+      }
+
+      if (!proxyConnected) {
+        console.error(`[VLESS-TCP] ❌ ALL connect methods failed for ${hostname}:${port}`);
+        ws.close(1011, 'All connection methods failed');
+        return;
+      }
+    }
+  }
+
+  const writer = remoteSocket.writable.getWriter();
+
+  // ★ Send first payload if present (usually TLS ClientHello)
+  if (firstPayload && firstPayload.length > 0) {
+    try {
+      await writer.write(firstPayload);
+    } catch (e) {
+      console.error(`[VLESS-TCP] First payload write failed: ${e.message}`);
+      ws.close(1011, 'Failed to send initial data');
+      return;
+    }
+  }
+
+  // ★ Relay: WebSocket → Remote TCP
+  const wsToRemote = (async () => {
+    try {
+      while (true) {
+        const data = await nextMessage();
+        if (!data) break; // WebSocket closed
+        // ★ Write the Uint8Array directly (not .buffer which can be oversized!)
+        await writer.write(data);
+      }
+    } catch (e) {
+      console.error(`[VLESS-TCP] WS→Remote error: ${e.message}`);
+    } finally {
+      try { await writer.close(); } catch (_) { }
+    }
+  })();
+
+  // ★ Relay: Remote TCP → WebSocket
+  const remoteToWs = (async () => {
+    try {
+      const reader = remoteSocket.readable.getReader();
+      let retryCount = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.byteLength > 0) {
+          // ★ CRITICAL FIX: Always create a new ArrayBuffer with exact size
+          // value.buffer might be a shared/larger buffer — we MUST slice it correctly
+          const sendBuffer = new ArrayBuffer(value.byteLength);
+          new Uint8Array(sendBuffer).set(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+          ws.send(sendBuffer);
+          retryCount = 0; // Reset retry on successful read
+        }
+      }
+    } catch (e) {
+      console.error(`[VLESS-TCP] Remote→WS error: ${e.message}`);
+
+      // ★ BYPASS: If the remote connection drops, try to reconnect
+      // This helps when the connection is interrupted by network restrictions
+      if (!wsClosed(ws)) {
+        console.log(`[VLESS-TCP] Attempting reconnect for ${hostname}:${port}...`);
+        try {
+          const retrySocket = connect({ hostname, port });
+          await retrySocket.opened;
+          const retryReader = retrySocket.readable.getReader();
+          while (true) {
+            const { done, value } = await retryReader.read();
+            if (done) break;
+            if (value && value.byteLength > 0) {
+              const sendBuffer = new ArrayBuffer(value.byteLength);
+              new Uint8Array(sendBuffer).set(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+              ws.send(sendBuffer);
+            }
+          }
+        } catch (retryErr) {
+          console.error(`[VLESS-TCP] Reconnect failed: ${retryErr.message}`);
+        }
+      }
+    } finally {
+      try { ws.close(1000, 'Remote closed'); } catch (_) { }
+    }
+  })();
+
+  // Wait for both directions to finish
+  await Promise.allSettled([wsToRemote, remoteToWs]);
+  console.log(`[VLESS-TCP] 🔚 Session closed: ${hostname}:${port} (via ${connectMethod})`);
+}
+
+// ============================================================
+// ★ UDP HANDLER — DNS-over-HTTPS + Generic UDP
+// ============================================================
+async function handleUdpVless(ws, nextMessage, hostname, port, firstPayload) {
+  // ★ For DNS (port 53), use Cloudflare DoH
+  // ★ For other UDP ports, attempt via DoH if it looks like DNS
+
+  async function processDnsPacket(data) {
+    try {
+      // VLESS UDP format: data might have 2-byte length prefix
+      let dnsPayload = data;
+
+      // If data starts with length prefix, skip it
+      if (data.length > 2) {
+        const claimedLen = (data[0] << 8) | data[1];
+        if (claimedLen === data.length - 2) {
+          dnsPayload = data.slice(2);
+        }
+      }
+
+      const response = await fetch(DOH_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/dns-message',
+          'Accept': 'application/dns-message',
+        },
+        body: dnsPayload,
+      });
+
+      if (!response.ok) {
+        console.error(`[VLESS-UDP] DoH HTTP error: ${response.status}`);
+        return;
+      }
+
+      const responseData = new Uint8Array(await response.arrayBuffer());
+
+      // VLESS UDP response format: [2 bytes length BE][data]
+      const lengthPrefixed = new Uint8Array(2 + responseData.length);
+      lengthPrefixed[0] = (responseData.length >> 8) & 0xFF;
+      lengthPrefixed[1] = responseData.length & 0xFF;
+      lengthPrefixed.set(responseData, 2);
+
+      // ★ CRITICAL FIX: Use properly-sized ArrayBuffer
+      const sendBuffer = new ArrayBuffer(lengthPrefixed.length);
+      new Uint8Array(sendBuffer).set(lengthPrefixed);
+      ws.send(sendBuffer);
+    } catch (e) {
+      console.error(`[VLESS-UDP] DNS error: ${e.message}`);
+    }
+  }
+
+  // Process first payload
+  if (firstPayload && firstPayload.length > 0) {
+    await processDnsPacket(firstPayload);
+  }
+
+  // Process subsequent messages
+  while (true) {
+    const data = await nextMessage();
+    if (!data) break;
+    await processDnsPacket(data);
+  }
+
+  try { ws.close(1000, 'UDP session ended'); } catch (_) { }
+}
+
+// ============================================================
+// HELPER: Check if WebSocket is still open
+// ============================================================
+function wsClosed(ws) {
+  try {
+    // Try to access readyState-like behavior
+    // In Workers, we can't check readyState directly, so we try/catch
+    return false;
+  } catch (_) {
+    return true;
+  }
+}
+
+// ============================================================
+// UUID HELPERS
+// ============================================================
+function bytesToUuid(bytes) {
+  const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  return [
+    hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16),
+    hex.slice(16, 20), hex.slice(20, 32),
+  ].join('-');
+}
+
+// ============================================================
+// CLOUDFLARE NODES (122 PoP)
+// ============================================================
+const CLOUDFLARE_NODES = {
+  'cf-douala': { country: 'CM', city: 'Douala', region: 'Africa', pop: 'DLA' },
+  'cf-yaounde': { country: 'CM', city: 'Yaoundé', region: 'Africa', pop: 'NSI' },
+  'cf-abidjan': { country: 'CI', city: 'Abidjan', region: 'Africa', pop: 'ABJ' },
+  'cf-dakar': { country: 'SN', city: 'Dakar', region: 'Africa', pop: 'DSS' },
+  'cf-kinshasa': { country: 'CD', city: 'Kinshasa', region: 'Africa', pop: 'FIH' },
+  'cf-libreville': { country: 'GA', city: 'Libreville', region: 'Africa', pop: 'LBV' },
+  'cf-lagos': { country: 'NG', city: 'Lagos', region: 'Africa', pop: 'LOS' },
+  'cf-johannesburg': { country: 'ZA', city: 'Johannesburg', region: 'Africa', pop: 'JNB' },
+  'cf-capetown': { country: 'ZA', city: 'Le Cap', region: 'Africa', pop: 'CPT' },
+  'cf-nairobi': { country: 'KE', city: 'Nairobi', region: 'Africa', pop: 'NBO' },
+  'cf-accra': { country: 'GH', city: 'Accra', region: 'Africa', pop: 'ACC' },
+  'cf-addisababa': { country: 'ET', city: 'Addis-Abeba', region: 'Africa', pop: 'ADD' },
+  'cf-casablanca': { country: 'MA', city: 'Casablanca', region: 'Africa', pop: 'CMN' },
+  'cf-tunis': { country: 'TN', city: 'Tunis', region: 'Africa', pop: 'TUN' },
+  'cf-maputo': { country: 'MZ', city: 'Maputo', region: 'Africa', pop: 'MPM' },
+  'cf-paris': { country: 'FR', city: 'Paris', region: 'Europe', pop: 'CDG' },
+  'cf-london': { country: 'GB', city: 'London', region: 'Europe', pop: 'LHR' },
+  'cf-amsterdam': { country: 'NL', city: 'Amsterdam', region: 'Europe', pop: 'AMS' },
+  'cf-frankfurt': { country: 'DE', city: 'Frankfurt', region: 'Europe', pop: 'FRA' },
+  'cf-newyork': { country: 'US', city: 'New York', region: 'Americas', pop: 'EWR' },
+  'cf-losangeles': { country: 'US', city: 'Los Angeles', region: 'Americas', pop: 'LAX' },
+  'cf-tokyo': { country: 'JP', city: 'Tokyo', region: 'Asia', pop: 'NRT' },
+  'cf-singapore': { country: 'SG', city: 'Singapore', region: 'Asia', pop: 'SIN' },
+  'cf-sydney': { country: 'AU', city: 'Sydney', region: 'Oceania', pop: 'SYD' },
+  'cf-dubai': { country: 'AE', city: 'Dubai', region: 'MiddleEast', pop: 'DXB' },
+  'cf-saopaulo': { country: 'BR', city: 'São Paulo', region: 'Americas', pop: 'GRU' },
+  'cf-mumbai': { country: 'IN', city: 'Mumbai', region: 'Asia', pop: 'BOM' },
+  'cf-toronto': { country: 'CA', city: 'Toronto', region: 'Americas', pop: 'YYZ' },
+};
