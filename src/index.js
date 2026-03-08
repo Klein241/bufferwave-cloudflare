@@ -1,14 +1,15 @@
 // ============================================================
-// BUFFERWAVE EDGE v11.0 — VLESS + MESH SIGNALING
+// BUFFERWAVE EDGE v12.0 — VLESS + MESH SIGNALING (Durable Object)
 //
 // Architecture :
-//   Android → WebSocket → Worker → fetch() → Internet
-//   Android → WebSocket → Worker /mesh → Peer Discovery
+//   Android → WebSocket → Worker → Durable Object (MeshRoom) → Peer Discovery
+//   Android → WebSocket → Worker /relay → Durable Object (MeshRoom) → Paired Relay
+//   Android → WebSocket → Worker /vless → fetch() → Internet
 //
-// Mesh Signaling :
-//   /mesh : WebSocket endpoint for peer registration & discovery
-//   Peers register, send heartbeats, and find each other
-//   globally (Jean in Cameroon finds Marie in France)
+// CRITICAL FIX: Mesh signaling now uses a Durable Object so ALL
+// peers are guaranteed to be in the SAME instance. Without this,
+// Cloudflare Workers spawn isolated instances and peers on
+// different instances never see each other.
 // ============================================================
 
 const DEFAULT_UUID = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
@@ -20,20 +21,39 @@ export default {
       const url = new URL(request.url);
       const uuid = env.VLESS_UUID || DEFAULT_UUID;
 
-      // ── Mesh Signaling ──
+      // ── Mesh Signaling → Durable Object ──
       if (url.pathname === '/mesh') {
         if (request.headers.get('Upgrade') !== 'websocket') {
           return new Response('WebSocket required for mesh', { status: 426 });
         }
-        return handleMeshSignaling(request, url);
+        // Route ALL mesh traffic to the SAME Durable Object instance
+        const roomId = env.MESH_ROOM.idFromName('global-mesh');
+        const room = env.MESH_ROOM.get(roomId);
+        return room.fetch(request);
       }
 
-      // ── Raw Relay — Relais binaire entre 2 pairs (TailscaleMode) ──
+      // ── Raw Relay → Durable Object (same room for pairing) ──
       if (url.pathname === '/tunnel' || url.pathname === '/relay') {
         if (request.headers.get('Upgrade') !== 'websocket') {
           return new Response('WebSocket required', { status: 426 });
         }
-        return handleRelay(request, url);
+        const roomId = env.MESH_ROOM.idFromName('global-mesh');
+        const room = env.MESH_ROOM.get(roomId);
+        return room.fetch(request);
+      }
+
+      // ── Relay status debug (HTTP) → Durable Object ──
+      // ✅ CORRIGÉ — route /relay/status pour debug terrain
+      if (url.pathname === '/relay/status') {
+        try {
+          const roomId = env.MESH_ROOM.idFromName('global-mesh');
+          const room = env.MESH_ROOM.get(roomId);
+          return room.fetch(new Request('https://internal/relay/status'));
+        } catch (e) {
+          return new Response(JSON.stringify({ waiting: [], paired: [], error: e.message }), {
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+          });
+        }
       }
 
       // ── WebSocket Tunnel (VLESS protocol) ──
@@ -53,14 +73,22 @@ export default {
       };
       if (request.method === 'OPTIONS') return new Response(null, { headers: h });
 
-      // ── Health ──
+      // ── Health — ask Durable Object for peer count ──
       if (url.pathname === '/' || url.pathname === '/health') {
+        let meshPeers = 0;
+        try {
+          const roomId = env.MESH_ROOM.idFromName('global-mesh');
+          const room = env.MESH_ROOM.get(roomId);
+          const peerResp = await room.fetch(new Request('https://internal/peers'));
+          const peerData = await peerResp.json();
+          meshPeers = peerData.count || 0;
+        } catch (_) { }
         return new Response(JSON.stringify({
-          server: 'BufferWave Edge v11.0',
+          server: 'BufferWave Edge v12.0',
           status: 'ACTIVE',
-          mode: 'fetch-proxy+mesh',
-          features: ['https-proxy', 'dns-over-https', 'websocket-tunnel', 'mesh-signaling'],
-          meshPeers: meshNodes.size,
+          mode: 'durable-object+mesh',
+          features: ['https-proxy', 'dns-over-https', 'websocket-tunnel', 'mesh-signaling', 'durable-object'],
+          meshPeers,
           timestamp: new Date().toISOString(),
           ok: true,
         }), { headers: h });
@@ -103,19 +131,15 @@ export default {
         }
       }
 
-      // ── Mesh peers list (HTTP) ──
+      // ── Mesh peers list (HTTP) → Durable Object ──
       if (url.pathname === '/mesh/peers') {
-        const peers = Array.from(meshNodes.values()).map(n => ({
-          node: n.nodeId,
-          name: n.name,
-          role: n.role,
-          alive: n.alive,
-          region: n.region,
-          quality: n.quality,
-          access: n.access,
-          since: n.since,
-        }));
-        return new Response(JSON.stringify({ peers, count: peers.length }), { headers: h });
+        try {
+          const roomId = env.MESH_ROOM.idFromName('global-mesh');
+          const room = env.MESH_ROOM.get(roomId);
+          return room.fetch(new Request('https://internal/peers'));
+        } catch (e) {
+          return new Response(JSON.stringify({ peers: [], count: 0 }), { headers: h });
+        }
       }
 
       return new Response('Not Found', { status: 404 });
@@ -128,262 +152,291 @@ export default {
 };
 
 // ============================================================
-// MESH SIGNALING — Global Peer Discovery
-//
-// Each peer connects via WebSocket to /mesh.
-// The Worker maintains a registry of active nodes.
-// Peers send heartbeats; stale peers are removed.
-//
-// Messages:
-//   announce  → Register this node
-//   heartbeat → Keep alive
-//   list_peers → Get available peers
-//   bridge_offer → Request to use someone's internet
-//   bridge_accept → Accept the bridge request
-//   depart → Node leaving
+// MESH ROOM — Durable Object
+// Single global instance that holds ALL mesh peers and relays.
+// Guarantees all peers are in the same memory space.
 // ============================================================
+export class MeshRoom {
+  constructor(state, env) {
+    this.state = state;
+    this.meshNodes = new Map();   // nodeId → { nodeId, name, role, alive, region, quality, access, since, lastSeen }
+    this.meshSockets = new Map(); // nodeId → WebSocket
+    this.relayWaiting = new Map();
+    this.relayPaired = new Map();
 
-// In-memory peer registry (lives as long as the Worker instance)
-const meshNodes = new Map();
-const meshSockets = new Map();
-
-// Cleanup stale nodes — runs lazily on each mesh interaction
-const STALE_TIMEOUT = 60000;
-let _lastCleanup = 0;
-function cleanupStaleNodes() {
-  const now = Date.now();
-  if (now - _lastCleanup < 30000) return; // At most once per 30s
-  _lastCleanup = now;
-  for (const [id, node] of meshNodes) {
-    if (now - node.lastSeen > STALE_TIMEOUT) {
-      meshNodes.delete(id);
-      meshSockets.delete(id);
-      console.log(`[MESH] Stale node removed: ${id}`);
-    }
-  }
-}
-
-function handleMeshSignaling(request, url) {
-  const pair = new WebSocketPair();
-  const [client, server] = Object.values(pair);
-  server.accept();
-
-  const nodeId = url.searchParams.get('node') || '';
-  const nodeName = url.searchParams.get('name') || 'Appareil';
-  const nodeRole = url.searchParams.get('role') || 'seeker';
-
-  // Detect region from CF headers
-  const cfCountry = request.headers.get('cf-ipcountry') || 'XX';
-
-  if (nodeId) {
-    meshNodes.set(nodeId, {
-      nodeId,
-      name: nodeName,
-      role: nodeRole,
-      alive: true,
-      region: cfCountry,
-      quality: 50,
-      access: 'unknown',
-      since: new Date().toISOString(),
-      lastSeen: Date.now(),
-    });
-    meshSockets.set(nodeId, server);
-    console.log(`[MESH] Node joined: ${nodeId} (${nodeName}) from ${cfCountry} as ${nodeRole}`);
-  }
-
-  server.addEventListener('message', ev => {
-    try {
-      const data = JSON.parse(ev.data);
-      handleMeshMessage(server, nodeId, data);
-    } catch (_) { }
-  });
-
-  server.addEventListener('close', () => {
-    meshNodes.delete(nodeId);
-    meshSockets.delete(nodeId);
-    console.log(`[MESH] Node left: ${nodeId}`);
-  });
-
-  server.addEventListener('error', () => {
-    meshNodes.delete(nodeId);
-    meshSockets.delete(nodeId);
-  });
-
-  // Send initial peer list
-  sendPeerList(server, nodeId);
-
-  return new Response(null, { status: 101, webSocket: client });
-}
-
-function handleMeshMessage(ws, senderId, data) {
-  // Lazy cleanup of stale nodes
-  cleanupStaleNodes();
-
-  // Support abbreviated actions from low-bandwidth clients
-  // 'a' = action alias, 'hb' = heartbeat, 'n' = node
-  let action = data.action || data.a || '';
-  if (action === 'hb') action = 'heartbeat';
-  if (data.n && !senderId && !data.node) data.node = data.n;
-
-  switch (action) {
-    case 'announce': {
-      const node = meshNodes.get(senderId);
-      if (node) {
-        node.name = data.name || node.name;
-        node.role = data.role || node.role;
-        node.lastSeen = Date.now();
-        node.alive = true;
-      }
-      // Broadcast to all peers that someone joined
-      broadcastEvent({ action: 'peer_joined', node: senderId, name: data.name }, senderId);
-      break;
-    }
-
-    case 'heartbeat': {
-      const node = meshNodes.get(senderId);
-      if (node) {
-        node.lastSeen = Date.now();
-        node.alive = true;
-      }
-      safeSend(ws, { action: 'heartbeat_ack', ts: Date.now() });
-      break;
-    }
-
-    case 'list_peers': {
-      sendPeerList(ws, senderId);
-      break;
-    }
-
-    case 'bridge_offer':
-    case 'bridge_accept': {
-      // Forward to the target peer
-      const targetId = data.to || '';
-      const targetWs = meshSockets.get(targetId);
-      if (targetWs) {
-        safeSend(targetWs, data);
-        console.log(`[MESH] ${action}: ${senderId} -> ${targetId}`);
-      }
-      break;
-    }
-
-    case 'depart': {
-      meshNodes.delete(senderId);
-      meshSockets.delete(senderId);
-      broadcastEvent({ action: 'peer_left', node: senderId }, senderId);
-      break;
-    }
-  }
-}
-
-function sendPeerList(ws, excludeId) {
-  const peers = [];
-  for (const [id, node] of meshNodes) {
-    if (id === excludeId) continue;
-    peers.push({
-      node: node.nodeId,
-      name: node.name,
-      role: node.role,
-      alive: node.alive,
-      region: node.region,
-      quality: node.quality,
-      access: node.access,
-      bw: 0,
+    // Periodic cleanup of stale nodes (every 30s)
+    this.state.blockConcurrencyWhile(async () => {
+      this._cleanupInterval = setInterval(() => this._cleanupStale(), 30000);
     });
   }
-  safeSend(ws, { action: 'peer_list', peers });
-}
 
-function broadcastEvent(event, excludeId) {
-  for (const [id, ws] of meshSockets) {
-    if (id === excludeId) continue;
-    safeSend(ws, event);
-  }
-}
-
-// ============================================================
-// RAW RELAY — Binary relay between paired peers
-// ============================================================
-const relayWaiting = new Map();
-const relayPaired = new Map();
-
-function makeRelayKey(a, b) { return `${a}→${b}`; }
-
-function handleRelay(request, url) {
-  const pair = new WebSocketPair();
-  const [client, server] = Object.values(pair);
-  server.accept();
-
-  const userId = url.searchParams.get('user') || '';
-  const peerId = url.searchParams.get('peer') || '';
-  const myKey = makeRelayKey(userId, peerId);
-  const partnerKey = makeRelayKey(peerId, userId);
-
-  console.log(`[RELAY] New: ${userId} wants ${peerId}`);
-
-  const partner = relayWaiting.get(partnerKey);
-
-  if (partner) {
-    // Partner found — pair them
-    relayWaiting.delete(partnerKey);
-    relayPaired.set(myKey, partnerKey);
-    relayPaired.set(partnerKey, myKey);
-    const pw = partner.ws;
-    console.log(`[RELAY] ✅ Paired: ${userId} ↔ ${peerId}`);
-
-    safeSend(server, { action: 'relay_paired', partner: peerId });
-    safeSend(pw, { action: 'relay_paired', partner: userId });
-
-    // Bidirectional relay
-    server.addEventListener('message', ev => {
-      try { pw.send(ev.data); } catch (_) { }
-    });
-    pw.addEventListener('message', ev => {
-      try { server.send(ev.data); } catch (_) { }
-    });
-
-    // Cleanup
-    const cleanup = (side, other) => {
-      relayPaired.delete(myKey);
-      relayPaired.delete(partnerKey);
-      try { other.close(1000, 'partner-left'); } catch (_) { }
-    };
-    server.addEventListener('close', () => cleanup('A', pw));
-    server.addEventListener('error', () => cleanup('A', pw));
-    pw.addEventListener('close', () => cleanup('B', server));
-    pw.addEventListener('error', () => cleanup('B', server));
-  } else {
-    // Wait for partner
-    relayWaiting.set(myKey, { ws: server, userId, peerId });
-    console.log(`[RELAY] ${userId} waiting for ${peerId}...`);
-    safeSend(server, { action: 'relay_waiting' });
-
-    const timeout = setTimeout(() => {
-      if (relayWaiting.has(myKey)) {
-        relayWaiting.delete(myKey);
-        try { server.close(1000, 'timeout'); } catch (_) { }
+  _cleanupStale() {
+    const now = Date.now();
+    for (const [id, node] of this.meshNodes) {
+      if (now - node.lastSeen > 90000) { // 90s stale timeout
+        this.meshNodes.delete(id);
+        const ws = this.meshSockets.get(id);
+        this.meshSockets.delete(id);
+        try { ws?.close(1000, 'stale'); } catch (_) { }
+        this._broadcast({ action: 'peer_left', node: id, name: node.name }, id);
+        console.log(`[MESH-DO] Stale: ${id}`);
       }
-    }, 120_000);
+    }
+  }
 
-    server.addEventListener('close', () => { relayWaiting.delete(myKey); clearTimeout(timeout); });
-    server.addEventListener('error', () => { relayWaiting.delete(myKey); clearTimeout(timeout); });
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    // ── HTTP: return peer list ──
+    if (url.pathname === '/peers') {
+      const peers = [];
+      for (const [id, node] of this.meshNodes) {
+        peers.push({
+          node: node.nodeId, name: node.name, role: node.role,
+          alive: node.alive, region: node.region, quality: node.quality,
+          access: node.access, bw: 0,
+        });
+      }
+      return new Response(JSON.stringify({ peers, count: peers.length }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      });
+    }
+
+    // ── HTTP: relay status debug ──
+    // ✅ CORRIGÉ — endpoint debug pour vérifier l'état du relay sur le terrain
+    if (url.pathname === '/relay/status') {
+      return new Response(JSON.stringify({
+        waiting: [...this.relayWaiting.keys()],
+        paired: [...this.relayPaired.keys()],
+        meshPeers: this.meshNodes.size,
+        timestamp: new Date().toISOString(),
+      }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      });
+    }
+
+    // ── Must be WebSocket upgrade ──
+    if (request.headers.get('Upgrade') !== 'websocket') {
+      return new Response('WebSocket required', { status: 426 });
+    }
+
+    // Detect if this is a relay or mesh connection
+    if (url.pathname === '/tunnel' || url.pathname === '/relay') {
+      return this._handleRelay(request, url);
+    }
+
+    return this._handleMesh(request, url);
+  }
+
+  // ═════════════════════════════════════════════
+  // MESH SIGNALING
+  // ═════════════════════════════════════════════
+  _handleMesh(request, url) {
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+
+    const nodeId = url.searchParams.get('node') || '';
+    const nodeName = url.searchParams.get('name') || 'Appareil';
+    const nodeRole = url.searchParams.get('role') || 'seeker';
+    const cfCountry = request.headers.get('cf-ipcountry') || 'XX';
+
+    if (nodeId) {
+      // Close previous connection from same node (reconnect scenario)
+      const oldWs = this.meshSockets.get(nodeId);
+      if (oldWs) {
+        try { oldWs.close(1000, 'replaced'); } catch (_) { }
+      }
+
+      this.meshNodes.set(nodeId, {
+        nodeId, name: nodeName, role: nodeRole,
+        alive: true, region: cfCountry, quality: 50,
+        access: 'unknown', since: new Date().toISOString(), lastSeen: Date.now(),
+      });
+      this.meshSockets.set(nodeId, server);
+      console.log(`[MESH-DO] Join: ${nodeId} (${nodeName}) ${cfCountry} as ${nodeRole}`);
+    }
 
     server.addEventListener('message', ev => {
-      if (typeof ev.data === 'string') {
-        try {
-          const d = JSON.parse(ev.data);
-          if (d.a === 'ping') safeSend(server, { action: 'pong' });
-        } catch (_) { }
-      }
+      try {
+        const data = JSON.parse(ev.data);
+        this._onMeshMessage(server, nodeId, data);
+      } catch (_) { }
     });
+
+    server.addEventListener('close', () => {
+      const name = this.meshNodes.get(nodeId)?.name || nodeId;
+      this.meshNodes.delete(nodeId);
+      this.meshSockets.delete(nodeId);
+      this._broadcast({ action: 'peer_left', node: nodeId, name }, nodeId);
+      console.log(`[MESH-DO] Left: ${nodeId}`);
+    });
+
+    server.addEventListener('error', () => {
+      this.meshNodes.delete(nodeId);
+      this.meshSockets.delete(nodeId);
+    });
+
+    // Send initial peer list immediately
+    this._sendPeerList(server, nodeId);
+
+    // Broadcast to all existing peers that someone joined
+    this._broadcast({ action: 'peer_joined', node: nodeId, name: nodeName }, nodeId);
+    // Also send peer_list to all existing peers so they refresh their lists
+    for (const [id, ws] of this.meshSockets) {
+      if (id !== nodeId) this._sendPeerList(ws, id);
+    }
+
+    return new Response(null, { status: 101, webSocket: client });
   }
 
-  return new Response(null, { status: 101, webSocket: client });
-}
+  _onMeshMessage(ws, senderId, data) {
+    let action = data.action || data.a || '';
+    if (action === 'hb') action = 'heartbeat';
 
-function safeSend(ws, data) {
-  try {
-    ws.send(JSON.stringify(data));
-  } catch (_) { }
+    switch (action) {
+      case 'announce': {
+        const node = this.meshNodes.get(senderId);
+        if (node) {
+          node.name = data.name || node.name;
+          node.role = data.role || node.role;
+          node.lastSeen = Date.now();
+          node.alive = true;
+        }
+        this._broadcast({ action: 'peer_joined', node: senderId, name: data.name }, senderId);
+        // Envoyer les listes mises à jour à TOUS les peers
+        for (const [id, peerWs] of this.meshSockets) {
+          this._sendPeerList(peerWs, id);
+        }
+        break;
+      }
+      case 'heartbeat': {
+        const node = this.meshNodes.get(senderId);
+        if (node) { node.lastSeen = Date.now(); node.alive = true; }
+        this._safeSend(ws, { action: 'heartbeat_ack', ts: Date.now() });
+        break;
+      }
+      case 'list_peers': {
+        this._sendPeerList(ws, senderId);
+        break;
+      }
+      case 'bridge_offer':
+      case 'bridge_accept': {
+        const targetId = data.to || '';
+        const targetWs = this.meshSockets.get(targetId);
+        if (targetWs) {
+          this._safeSend(targetWs, data);
+          console.log(`[MESH-DO] ${action}: ${senderId} → ${targetId}`);
+        }
+        break;
+      }
+      case 'depart': {
+        const name = this.meshNodes.get(senderId)?.name || senderId;
+        this.meshNodes.delete(senderId);
+        this.meshSockets.delete(senderId);
+        this._broadcast({ action: 'peer_left', node: senderId, name }, senderId);
+        break;
+      }
+    }
+  }
+
+  _sendPeerList(ws, excludeId) {
+    const peers = [];
+    for (const [id, node] of this.meshNodes) {
+      if (id === excludeId) continue;
+      peers.push({
+        node: node.nodeId, name: node.name, role: node.role,
+        alive: node.alive, region: node.region, quality: node.quality,
+        access: node.access, bw: 0,
+      });
+    }
+    this._safeSend(ws, { action: 'peer_list', peers });
+  }
+
+  _broadcast(event, excludeId) {
+    for (const [id, ws] of this.meshSockets) {
+      if (id === excludeId) continue;
+      this._safeSend(ws, event);
+    }
+  }
+
+  // ═════════════════════════════════════════════
+  // RAW RELAY (inside Durable Object = same memory)
+  // ═════════════════════════════════════════════
+  _handleRelay(request, url) {
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+
+    const userId = url.searchParams.get('user') || '';
+    const peerId = url.searchParams.get('peer') || '';
+    const myKey = `${userId}→${peerId}`;
+    const partnerKey = `${peerId}→${userId}`;
+
+    // ✅ CORRIGÉ — logs améliorés pour debug terrain
+    console.log(`[RELAY-DO] Connect: user=${userId} peer=${peerId} key=${myKey}`);
+    console.log(`[RELAY-DO] Waiting keys: ${[...this.relayWaiting.keys()].join(', ') || '(none)'}`);
+    console.log(`[RELAY-DO] Looking for partnerKey: ${partnerKey}`);
+
+    const partner = this.relayWaiting.get(partnerKey);
+
+    if (partner) {
+      this.relayWaiting.delete(partnerKey);
+      this.relayPaired.set(myKey, partnerKey);
+      this.relayPaired.set(partnerKey, myKey);
+      const pw = partner.ws;
+      console.log(`[RELAY-DO] ✅ Paired: ${userId} ↔ ${peerId}`);
+
+      this._safeSend(server, { action: 'relay_paired', partner: peerId });
+      this._safeSend(pw, { action: 'relay_paired', partner: userId });
+
+      server.addEventListener('message', ev => {
+        try { pw.send(ev.data); } catch (_) { }
+      });
+      pw.addEventListener('message', ev => {
+        try { server.send(ev.data); } catch (_) { }
+      });
+
+      const cleanup = (side, other) => {
+        this.relayPaired.delete(myKey);
+        this.relayPaired.delete(partnerKey);
+        try { other.close(1000, 'partner-left'); } catch (_) { }
+      };
+      server.addEventListener('close', () => cleanup('A', pw));
+      server.addEventListener('error', () => cleanup('A', pw));
+      pw.addEventListener('close', () => cleanup('B', server));
+      pw.addEventListener('error', () => cleanup('B', server));
+    } else {
+      this.relayWaiting.set(myKey, { ws: server, userId, peerId });
+      console.log(`[RELAY-DO] ${userId} waiting for ${peerId}...`);
+      this._safeSend(server, { action: 'relay_waiting' });
+
+      const timeout = setTimeout(() => {
+        if (this.relayWaiting.has(myKey)) {
+          this.relayWaiting.delete(myKey);
+          try { server.close(1000, 'timeout'); } catch (_) { }
+        }
+      }, 120_000);
+
+      server.addEventListener('close', () => { this.relayWaiting.delete(myKey); clearTimeout(timeout); });
+      server.addEventListener('error', () => { this.relayWaiting.delete(myKey); clearTimeout(timeout); });
+
+      server.addEventListener('message', ev => {
+        if (typeof ev.data === 'string') {
+          try {
+            const d = JSON.parse(ev.data);
+            if (d.a === 'ping') this._safeSend(server, { action: 'pong' });
+          } catch (_) { }
+        }
+      });
+    }
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  _safeSend(ws, data) {
+    try { ws.send(JSON.stringify(data)); } catch (_) { }
+  }
 }
 
 // ============================================================

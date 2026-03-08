@@ -5,3 +5,12 @@ compatibility_date = "2025-01-01"
 [vars]
 VLESS_UUID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 PROXY_IP = "cdn.xn--b6gac.eu.org"
+
+# Durable Object pour le mesh signaling — garantit UNE seule instance mémoire
+[[durable_objects.bindings]]
+name = "MESH_ROOM"
+class_name = "MeshRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MeshRoom"]
