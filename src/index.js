@@ -94,6 +94,27 @@ export default {
         }), { headers: h });
       }
 
+      // ── App Version (in-app update check) ──
+      // ✅ Endpoint pour vérifier les mises à jour depuis l'app
+      if (url.pathname === '/version') {
+        return new Response(JSON.stringify({
+          version: '1.1.0',
+          buildNumber: 3,
+          minVersion: '1.0.0',
+          apkUrl: 'https://github.com/Klein241/FriendlyNET/releases/latest/download/app-debug.apk',
+          releaseUrl: 'https://github.com/Klein241/FriendlyNET/releases/latest',
+          changelog: [
+            'Découverte de pairs plus rapide',
+            'Tunnel relay corrigé (0 octets résolu)',
+            'Nouvel écran de permissions',
+            'Mode éco amélioré',
+            'Stabilité WiFi Direct',
+          ],
+          forced: false,
+          timestamp: new Date().toISOString(),
+        }), { headers: h });
+      }
+
       // ── Config ──
       if (url.pathname === '/config') {
         return new Response(JSON.stringify({ uuid, path: '/vless', mode: 'fetch' }), { headers: h });
