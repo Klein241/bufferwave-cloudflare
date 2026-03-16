@@ -1,0 +1,14 @@
+
+ Ôøà´©Å wrangler 4.68.1 (update available 4.71.0)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+Total Upload: 21.41 KiB / gzip: 5.29 KiB
+Your Worker has access to the following bindings:
+Binding                                                      Resource                  
+env.MESH_ROOM (MeshRoom)                                     Durable Object            
+env.VLESS_UUID ("f47ac10b-58cc-4372-a567-0e02b2c3d479")      Environment Variable      
+env.PROXY_IP ("cdn.xn--b6gac.eu.org")                        Environment Variable      
+
+Uploaded friendlynet-mesh (9.13 sec)
+Deployed friendlynet-mesh triggers (5.57 sec)
+  https://friendlynet-mesh.bufferwave.workers.dev
+Current Version ID: cab1abaa-e8db-4f4d-b5ae-680b92c4701f

@@ -1,0 +1,14 @@
+name = "maisondepriere-notifications"
+main = "index.js"
+compatibility_date = "2026-03-01"
+
+[vars]
+# Non-sensitive vars
+VAPID_SUBJECT = "mailto:contact@maisondepriere.app"
+
+# Secrets (set with: wrangler secret put <NAME>)
+# VAPID_PUBLIC_KEY   = base64url public key
+# VAPID_PRIVATE_KEY  = base64url private key (PKCS8)
+# SUPABASE_URL       = https://xxx.supabase.co
+# SUPABASE_SERVICE_KEY = eyJ...
+# WEBHOOK_SECRET     = random secret for webhook auth
