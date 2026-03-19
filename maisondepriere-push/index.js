@@ -214,6 +214,172 @@ export default {
                 return json({ processed: true }, corsHeaders);
             }
 
+            // ═══ /notify — Main endpoint called by client-side notifications.ts ═══
+            // This is the bridge between in-app notifications and Web Push
+            if ((path === '/notify' || path === '/api/push/notify') && request.method === 'POST') {
+                const payload = await request.json();
+                const {
+                    action_type, actor_id, actor_name, actor_avatar,
+                    recipient_id, recipient_ids, target_id, target_name,
+                    is_anonymous, message_preview, extra_data
+                } = payload;
+
+                const recipientList = recipient_ids || (recipient_id ? [recipient_id] : []);
+                if (recipientList.length === 0) {
+                    return json({ success: true, sent: 0, reason: 'No recipients' }, corsHeaders);
+                }
+
+                // Build human-readable title & body from action_type
+                const name = is_anonymous ? 'Anonyme' : actor_name;
+                const short = (s, len = 60) => s ? (s.length > len ? s.substring(0, len) + '…' : s) : '';
+                let title = 'Maison de Prière';
+                let body = '';
+                let pushData = {};
+
+                switch (action_type) {
+                    case 'prayer_prayed':
+                        title = '🙏 Quelqu\'un a prié pour vous';
+                        body = `${name} a prié pour : "${short(target_name)}"`;
+                        pushData = { prayerId: target_id, type: 'prayer' };
+                        break;
+                    case 'friend_prayed':
+                        title = '🙏 Votre ami a prié';
+                        body = `${name} a aussi prié pour ce sujet`;
+                        pushData = { prayerId: target_id, type: 'prayer' };
+                        break;
+                    case 'new_prayer_published':
+                        title = '📢 Nouvelle demande de prière';
+                        body = `${name} a publié : "${short(target_name)}"`;
+                        pushData = { prayerId: target_id, type: 'prayer' };
+                        break;
+                    case 'prayer_comment':
+                        title = '💬 Nouveau commentaire';
+                        body = `${name} a commenté votre demande`;
+                        pushData = { prayerId: target_id, type: 'prayer' };
+                        break;
+                    case 'group_access_request':
+                        title = '👥 Demande d\'accès';
+                        body = `${name} souhaite rejoindre "${target_name}"`;
+                        pushData = { groupId: target_id, type: 'group' };
+                        break;
+                    case 'group_access_approved':
+                        title = '✅ Demande approuvée';
+                        body = `Accès au groupe "${target_name}" approuvé !`;
+                        pushData = { groupId: target_id, type: 'group' };
+                        break;
+                    case 'group_new_message':
+                        title = `💬 ${target_name || 'Groupe'}`;
+                        body = `${name}: ${short(message_preview, 80)}`;
+                        pushData = { groupId: target_id, type: 'group_message' };
+                        break;
+                    case 'admin_new_group':
+                        title = '🌟 Nouveau groupe';
+                        body = `Nouveau groupe officiel : ${target_name}`;
+                        pushData = { groupId: target_id, type: 'group' };
+                        break;
+                    case 'group_invitation':
+                        title = '👥 Invitation à un groupe';
+                        body = `${name} vous invite à "${target_name}"`;
+                        pushData = { groupId: target_id, type: 'group' };
+                        break;
+                    case 'group_mention':
+                        title = '🔔 Mention dans un groupe';
+                        body = `${name} vous a mentionné dans ${target_name}`;
+                        pushData = { groupId: target_id, type: 'group_message' };
+                        break;
+                    case 'dm_new_message':
+                        title = `💬 ${name}`;
+                        body = short(message_preview, 80);
+                        pushData = { conversationId: target_id, type: 'message' };
+                        break;
+                    case 'friend_request_received':
+                        title = '👋 Demande d\'ami';
+                        body = `${name} vous a envoyé une demande d'ami`;
+                        pushData = { type: 'friend_request' };
+                        break;
+                    case 'friend_request_accepted':
+                        title = '👋 Ami ajouté !';
+                        body = `${name} a accepté votre demande`;
+                        pushData = { conversationId: extra_data?.conversationId, type: 'friend' };
+                        break;
+                    case 'new_book_published':
+                        title = '📚 Nouveau livre';
+                        body = `"${target_name}" ajouté à la bibliothèque`;
+                        pushData = { bookId: target_id, type: 'book' };
+                        break;
+                    default:
+                        title = 'Notification';
+                        body = message_preview || 'Nouvelle notification';
+                        pushData = { type: 'general' };
+                }
+
+                // 1) Insert into Supabase notifications table (in-app)
+                const dbNotifs = recipientList
+                    .filter(id => id !== actor_id)
+                    .slice(0, 200)
+                    .map(userId => ({
+                        user_id: userId,
+                        title,
+                        message: body,
+                        type: action_type?.includes('prayer') ? 'prayer'
+                            : action_type?.includes('message') || action_type?.includes('mention') ? 'message'
+                                : 'info',
+                        action_type: action_type || 'general',
+                        action_data: JSON.stringify(pushData),
+                        is_read: false,
+                    }));
+
+                if (dbNotifs.length > 0) {
+                    // Batch insert (50 at a time)
+                    for (let i = 0; i < dbNotifs.length; i += 50) {
+                        const batch = dbNotifs.slice(i, i + 50);
+                        await supabaseFetch(env, '/rest/v1/notifications', {
+                            method: 'POST',
+                            body: JSON.stringify(batch),
+                        }).catch(e => console.error('DB insert error:', e));
+                    }
+                }
+
+                // 2) Send Web Push notifications (works even with browser closed!)
+                let pushSent = 0;
+                try {
+                    const targetUserIds = recipientList.filter(id => id !== actor_id).slice(0, 100);
+                    if (targetUserIds.length > 0) {
+                        const subs = await getSubscriptions(env, targetUserIds);
+                        if (subs.length > 0) {
+                            const results = await Promise.allSettled(
+                                subs.map(sub => sendPush(env, sub, {
+                                    title,
+                                    body,
+                                    data: pushData,
+                                    tag: `${action_type}_${target_id || Date.now()}`,
+                                }))
+                            );
+                            pushSent = results.filter(r => r.status === 'fulfilled' && r.value).length;
+
+                            // Deactivate expired subscriptions
+                            const failedEndpoints = [];
+                            results.forEach((r, i) => {
+                                if (r.status === 'rejected' || (r.status === 'fulfilled' && !r.value)) {
+                                    failedEndpoints.push(subs[i].endpoint);
+                                }
+                            });
+                            if (failedEndpoints.length > 0) {
+                                await deactivateSubscriptions(env, failedEndpoints);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.error('Push send error:', e);
+                }
+
+                return json({
+                    success: true,
+                    db_inserted: dbNotifs.length,
+                    push_sent: pushSent,
+                }, corsHeaders);
+            }
+
             // ═══ HEALTH CHECK ═══
             if (path === '/api/push/health') {
                 return json({
