@@ -9,7 +9,7 @@ VAPID_SUBJECT = "mailto:contact@maisondepriere.app"
 # R2 bucket binding for file storage (books, covers, etc.)
 [[r2_buckets]]
 binding = "R2_BUCKET"
-bucket_name = "maisondepriere-storage"
+bucket_name = "maisondepriere-library"
 
 # Secrets (set with: wrangler secret put <NAME>)
 # VAPID_PUBLIC_KEY   = base64url public key
