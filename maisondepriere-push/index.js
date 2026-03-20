@@ -24,8 +24,8 @@ export default {
         // CORS headers
         const corsHeaders = {
             'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-user-id',
         };
 
         if (request.method === 'OPTIONS') {
@@ -380,12 +380,99 @@ export default {
                 }, corsHeaders);
             }
 
+            // ═══ R2 FILE UPLOAD ═══
+            if (path === '/api/r2/upload' && request.method === 'POST') {
+                // Verify admin key
+                const authHeader = request.headers.get('Authorization') || '';
+                const token = authHeader.replace('Bearer ', '');
+                if (!token || (token !== env.ADMIN_KEY && token !== env.SUPABASE_SERVICE_KEY)) {
+                    return json({ error: 'Unauthorized' }, corsHeaders, 401);
+                }
+
+                if (!env.R2_BUCKET) {
+                    return json({ error: 'R2 bucket not configured' }, corsHeaders, 500);
+                }
+
+                const formData = await request.formData();
+                const file = formData.get('file');
+                const folder = formData.get('folder') || 'uploads';
+
+                if (!file || !file.name) {
+                    return json({ error: 'No file provided' }, corsHeaders, 400);
+                }
+
+                // Generate a unique key
+                const timestamp = Date.now();
+                const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+                const key = `${folder}/${timestamp}_${safeName}`;
+
+                // Upload to R2
+                const arrayBuffer = await file.arrayBuffer();
+                await env.R2_BUCKET.put(key, arrayBuffer, {
+                    httpMetadata: {
+                        contentType: file.type || 'application/octet-stream',
+                    },
+                    customMetadata: {
+                        originalName: file.name,
+                        uploadedAt: new Date().toISOString(),
+                    },
+                });
+
+                // Build public URL
+                const publicUrl = `${url.origin}/r2/${key}`;
+
+                return json({ url: publicUrl, key }, corsHeaders);
+            }
+
+            // ═══ R2 FILE SERVE (public read) ═══
+            if (path.startsWith('/r2/') && request.method === 'GET') {
+                if (!env.R2_BUCKET) {
+                    return json({ error: 'R2 bucket not configured' }, corsHeaders, 500);
+                }
+
+                const key = path.replace('/r2/', '');
+                const object = await env.R2_BUCKET.get(key);
+
+                if (!object) {
+                    return new Response('Not found', { status: 404, headers: corsHeaders });
+                }
+
+                const headers = new Headers(corsHeaders);
+                headers.set('Content-Type', object.httpMetadata?.contentType || 'application/octet-stream');
+                headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+                headers.set('ETag', object.httpEtag || '');
+
+                return new Response(object.body, { headers });
+            }
+
+            // ═══ R2 FILE DELETE ═══
+            if (path === '/api/r2/delete' && request.method === 'POST') {
+                const authHeader = request.headers.get('Authorization') || '';
+                const token = authHeader.replace('Bearer ', '');
+                if (!token || (token !== env.ADMIN_KEY && token !== env.SUPABASE_SERVICE_KEY)) {
+                    return json({ error: 'Unauthorized' }, corsHeaders, 401);
+                }
+
+                if (!env.R2_BUCKET) {
+                    return json({ error: 'R2 bucket not configured' }, corsHeaders, 500);
+                }
+
+                const { key } = await request.json();
+                if (!key) {
+                    return json({ error: 'Missing key' }, corsHeaders, 400);
+                }
+
+                await env.R2_BUCKET.delete(key);
+                return json({ success: true, deleted: key }, corsHeaders);
+            }
+
             // ═══ HEALTH CHECK ═══
             if (path === '/api/push/health') {
                 return json({
                     status: 'ok',
                     vapid_configured: !!(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY),
                     supabase_configured: !!env.SUPABASE_URL,
+                    r2_configured: !!env.R2_BUCKET,
                     time: new Date().toISOString(),
                 }, corsHeaders);
             }

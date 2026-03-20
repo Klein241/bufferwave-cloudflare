@@ -6,9 +6,15 @@ compatibility_date = "2026-03-01"
 # Non-sensitive vars
 VAPID_SUBJECT = "mailto:contact@maisondepriere.app"
 
+# R2 bucket binding for file storage (books, covers, etc.)
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "maisondepriere-storage"
+
 # Secrets (set with: wrangler secret put <NAME>)
 # VAPID_PUBLIC_KEY   = base64url public key
 # VAPID_PRIVATE_KEY  = base64url private key (PKCS8)
 # SUPABASE_URL       = https://xxx.supabase.co
 # SUPABASE_SERVICE_KEY = eyJ...
 # WEBHOOK_SECRET     = random secret for webhook auth
+# ADMIN_KEY          = admin access key for R2 uploads
