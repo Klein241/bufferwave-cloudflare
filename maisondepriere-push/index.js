@@ -477,6 +477,57 @@ export default {
                 }, corsHeaders);
             }
 
+            // ═══ GET /notify/count — nombre de notifs non lues ═══
+            if (path === '/notify/count' && request.method === 'GET') {
+                const userId = request.headers.get('x-user-id');
+                if (!userId) return json({ error: 'Missing x-user-id' }, corsHeaders, 401);
+
+                const res = await supabaseFetch(env,
+                    `/rest/v1/notifications?user_id=eq.${userId}&is_read=eq.false&select=id`,
+                    { method: 'GET', headers: { 'Prefer': 'count=exact' } }
+                );
+                const range = res.headers.get('Content-Range') || '*/0';
+                const count = parseInt(range.split('/')[1] ?? '0', 10);
+                return json({ count: isNaN(count) ? 0 : count }, corsHeaders);
+            }
+
+            // ═══ GET /notify/list — liste paginée ═══
+            if (path === '/notify/list' && request.method === 'GET') {
+                const userId = request.headers.get('x-user-id');
+                if (!userId) return json({ error: 'Missing x-user-id' }, corsHeaders, 401);
+
+                const p = new URL(request.url).searchParams;
+                const limit = Math.min(parseInt(p.get('limit') ?? '20', 10), 100);
+                const offset = parseInt(p.get('offset') ?? '0', 10);
+                const unread = p.get('unread') === 'true';
+
+                let q = `/rest/v1/notifications?user_id=eq.${userId}`
+                    + `&order=created_at.desc&limit=${limit}&offset=${offset}`
+                    + `&select=id,title,message,type,action_type,action_data,is_read,created_at`;
+                if (unread) q += '&is_read=eq.false';
+
+                const res = await supabaseFetch(env, q, { method: 'GET' });
+                const data = res.ok ? await res.json() : [];
+                return json({ notifications: data, limit, offset }, corsHeaders);
+            }
+
+            // ═══ PATCH /notify/read — marquer lu ═══
+            if (path === '/notify/read' && request.method === 'PATCH') {
+                const userId = request.headers.get('x-user-id');
+                if (!userId) return json({ error: 'Missing x-user-id' }, corsHeaders, 401);
+
+                const { notificationId, all } = await request.json();
+                const filter = all
+                    ? `/rest/v1/notifications?user_id=eq.${userId}&is_read=eq.false`
+                    : `/rest/v1/notifications?id=eq.${notificationId}&user_id=eq.${userId}`;
+
+                await supabaseFetch(env, filter, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ is_read: true })
+                });
+                return json({ success: true }, corsHeaders);
+            }
+
             return json({ error: 'Not found' }, corsHeaders, 404);
 
         } catch (e) {
@@ -585,10 +636,12 @@ async function webPush(env, sub, payload) {
     const vapidPrivateKey = env.VAPID_PRIVATE_KEY;
 
     // Import VAPID private key
-    const vapidKeyData = base64UrlDecode(vapidPrivateKey);
+    // web-push generate-vapid-keys outputs raw 32-byte P-256 scalar.
+    // crypto.subtle.importKey('pkcs8') expects ASN.1 DER → wrap it.
+    const rawKeyBuffer = base64UrlDecode(vapidPrivateKey);
     const vapidKey = await crypto.subtle.importKey(
         'pkcs8',
-        vapidKeyData,
+        rawPrivKeyToPkcs8(rawKeyBuffer),
         { name: 'ECDSA', namedCurve: 'P-256' },
         false,
         ['sign']
@@ -665,23 +718,15 @@ async function encryptPayload(sub, payload) {
     // Export ephemeral public key
     const ephemeralPublicKey = await crypto.subtle.exportKey('raw', ephemeralKeyPair.publicKey);
 
-    // Derive encryption key using HKDF
-    const sharedSecretKey = await crypto.subtle.importKey(
-        'raw',
-        sharedSecret,
-        { name: 'HKDF' },
-        false,
-        ['deriveBits']
-    );
-
     // Info for auth_secret HKDF
     const authInfo = new TextEncoder().encode('WebPush: info\0');
     const authInfoFull = concatenate(authInfo, new Uint8Array(clientPublicKey), new Uint8Array(ephemeralPublicKey));
 
-    // PRK using auth secret
-    const prkKey = await crypto.subtle.importKey('raw', clientAuth, { name: 'HKDF' }, false, ['deriveBits']);
+    // RFC 8291 §3.3: PRK = HKDF-Extract(salt=auth_secret, IKM=ecdh_secret)
+    // SubtleCrypto: importKey(IKM) + deriveBits({salt})
+    const prkKey = await crypto.subtle.importKey('raw', sharedSecret, { name: 'HKDF' }, false, ['deriveBits']);
     const prk = await crypto.subtle.deriveBits(
-        { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(sharedSecret), info: authInfoFull },
+        { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(clientAuth), info: authInfoFull },
         prkKey,
         256
     );
@@ -788,4 +833,25 @@ function parseDeviceName(ua) {
     if (ua.includes('Chrome')) return 'Chrome';
     if (ua.includes('Firefox')) return 'Firefox';
     return 'Unknown';
+}
+
+// Wraps a raw P-256 private key (32 bytes) in a PKCS8 DER envelope.
+// Structure: RFC 5958 PrivateKeyInfo, SEC 1 v2.0 ECPrivateKey.
+// OIDs: ecPublicKey (1.2.840.10045.2.1) + prime256v1 (1.2.840.10045.3.1.7)
+function rawPrivKeyToPkcs8(rawKeyBuffer) {
+    const prefix = new Uint8Array([
+        0x30, 0x41,             // SEQUENCE, length 65
+        0x02, 0x01, 0x00,       // INTEGER version=0
+        0x30, 0x13,             // SEQUENCE AlgorithmIdentifier
+        0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // OID ecPublicKey
+        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // OID prime256v1
+        0x04, 0x27,             // OCTET STRING, 39 bytes
+        0x30, 0x25,             // SEQUENCE ECPrivateKey
+        0x02, 0x01, 0x01,       // INTEGER version=1
+        0x04, 0x20              // OCTET STRING, 32 bytes follow
+    ]);
+    const out = new Uint8Array(35 + 32);
+    out.set(prefix);
+    out.set(new Uint8Array(rawKeyBuffer), 35);
+    return out.buffer;
 }
