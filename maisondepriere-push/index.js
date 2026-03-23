@@ -528,6 +528,59 @@ export default {
                 return json({ success: true }, corsHeaders);
             }
 
+            // ═══ PATCH /notify/read-all — marquer toutes lues ═══
+            if (path === '/notify/read-all' && request.method === 'PATCH') {
+                const userId = request.headers.get('x-user-id');
+                if (!userId) return json({ error: 'Missing x-user-id' }, corsHeaders, 401);
+
+                await supabaseFetch(env,
+                    `/rest/v1/notifications?user_id=eq.${userId}&is_read=eq.false`,
+                    { method: 'PATCH', body: JSON.stringify({ is_read: true }) }
+                );
+                return json({ success: true }, corsHeaders);
+            }
+
+            // ═══ GET /notify/preferences — get user notification preferences ═══
+            if (path === '/notify/preferences' && request.method === 'GET') {
+                const userId = request.headers.get('x-user-id');
+                if (!userId) return json({ error: 'Missing x-user-id' }, corsHeaders, 401);
+
+                try {
+                    const res = await supabaseFetch(env,
+                        `/rest/v1/notification_preferences?user_id=eq.${userId}&select=preferences`,
+                        { method: 'GET' }
+                    );
+                    const data = res.ok ? await res.json() : [];
+                    if (data && data.length > 0) {
+                        return json({ preferences: data[0].preferences || {} }, corsHeaders);
+                    }
+                } catch (e) { /* table may not exist */ }
+                return json({ preferences: {} }, corsHeaders);
+            }
+
+            // ═══ PATCH /notify/preferences — save user notification preferences ═══
+            if (path === '/notify/preferences' && request.method === 'PATCH') {
+                const userId = request.headers.get('x-user-id');
+                if (!userId) return json({ error: 'Missing x-user-id' }, corsHeaders, 401);
+
+                const { preferences } = await request.json();
+                try {
+                    await supabaseFetch(env,
+                        `/rest/v1/notification_preferences`,
+                        {
+                            method: 'POST',
+                            headers: { 'Prefer': 'resolution=merge-duplicates' },
+                            body: JSON.stringify({
+                                user_id: userId,
+                                preferences: preferences || {},
+                                updated_at: new Date().toISOString(),
+                            }),
+                        }
+                    );
+                } catch (e) { /* table may not exist — preferences stay client-side */ }
+                return json({ success: true }, corsHeaders);
+            }
+
             return json({ error: 'Not found' }, corsHeaders, 404);
 
         } catch (e) {
